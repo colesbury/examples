@@ -107,8 +107,13 @@ def main2():
         model = models.__dict__[args.arch]()
 
     model.cuda()
+
+    print("=> broadcasting initial parameters")
     for param in model.parameters():
         nccl2.broadcast(param.data, root=0)
+
+    # call all_reduce using backward hooks
+    register_all_reduce_hooks(model)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -131,6 +136,7 @@ def main2():
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
+    print("=> creating data loaders")
     train_loader = torch.utils.data.DataLoader(
         SubsampleDataset(datasets.ImageFolder(traindir, transforms.Compose([
             transforms.RandomSizedCrop(args.image_size),
@@ -162,6 +168,7 @@ def main2():
         validate(val_loader, model, criterion)
         return
 
+    print("=> starting training")
     for epoch in range(args.start_epoch, args.epochs):
         adjust_learning_rate(optimizer, epoch)
 
@@ -214,7 +221,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
-        all_reduce_grads(model, all_reduce_time)
+        finish_all_reduce(all_reduce_time)
         optimizer.step()
 
         # measure elapsed time
@@ -301,10 +308,67 @@ def average_batch_norm_stats(model):
             m.running_var /= args.num_replicas
 
 
+reduce_stream = None
+buffer_size = 10485760
+vars_to_reduce = []
+vars_seen = set()
+size_bytes = [0]
+
+
+def all_reduce_grads():
+    if len(vars_to_reduce) == 0:
+        return
+
+    global reduce_stream
+    if reduce_stream is None:
+        reduce_stream = torch.cuda.Stream()
+
+    default_stream = torch.cuda.current_stream()
+    reduce_stream.wait_stream(default_stream)
+
+    scale_factor = 1.0 / args.num_replicas
+    tensors = [p.grad.data for p in vars_to_reduce]
+    if len(tensors) == 1:
+        nccl2.all_reduce(tensors[0], stream=reduce_stream)
+        tensors[0] *= scale_factor
+    else:
+        buf = torch.cat([t.contiguous().view(-1) for t in tensors], 0)
+        buf *= scale_factor
+        nccl2.all_reduce(buf, stream=reduce_stream)
+        offset = 0
+        for t in tensors:
+            numel = t.numel()
+            t.set_(buf[offset:offset+numel].view_as(t))
+            offset += numel
+    vars_to_reduce.clear()
+    size_bytes[0] = 0
+
+
+def register_all_reduce_hooks(model):
+    import functools
+    device = torch.cuda.current_device()
+
+    def hook(var, grad):
+        with torch.cuda.device(device):
+            assert var not in vars_seen
+            param_size = grad.numel() * grad.element_size()
+            if size_bytes[0] + param_size > buffer_size:
+                all_reduce_grads()
+            vars_to_reduce.append(var)
+            vars_seen.add(var)
+            size_bytes[0] += param_size
+
+    def make_backward_hook(var):
+        return functools.partial(hook, var)
+
+    for param in model.parameters():
+        param.register_hook(make_backward_hook(param))
+
+
 events = []
 
 
-def all_reduce_grads(model, all_reduce_time):
+def finish_all_reduce(all_reduce_time):
     if len(events) == 0:
         events.extend([
             torch.cuda.Event(enable_timing=True),
@@ -314,24 +378,13 @@ def all_reduce_grads(model, all_reduce_time):
         elapsed_time = events[0].elapsed_time(events[1])
         all_reduce_time.update(elapsed_time / 1000.0)
 
+    all_reduce_grads()
+    vars_seen.clear()
+
+    default_stream = torch.cuda.current_stream()
+
     events[0].record()
-    buffer_size = 10485760
-    scale_factor = args.batch_size / 256.0
-    params = list(model.parameters())
-    for chunk in torch.cuda.comm._take_tensors(params, buffer_size):
-        tensors = [p.grad.data for p in chunk]
-        if len(tensors) == 1:
-            nccl2.all_reduce(tensors[0])
-            tensors[0] *= scale_factor
-        else:
-            buf = torch.cat([t.contiguous().view(-1) for t in tensors], 0)
-            buf *= scale_factor
-            nccl2.all_reduce(buf)
-            offset = 0
-            for t in tensors:
-                numel = t.numel()
-                t.set_(buf[offset:offset+numel].view_as(t))
-                offset += numel
+    default_stream.wait_stream(reduce_stream)
     events[1].record()
 
 
