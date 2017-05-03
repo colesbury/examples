@@ -2,6 +2,7 @@ import bisect
 import random
 import socket
 import struct
+import time
 import torch
 import torch.cuda.nccl2 as nccl2
 
@@ -41,6 +42,8 @@ def rendezvous(num_replicas, ttl=1):
         else:
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, ttl)
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
+
+        time.sleep(0.5)  # reduce chance that we send packet before joining group
 
         print('Finding other replicas...')
         sock.sendto(sendmsg, group)
