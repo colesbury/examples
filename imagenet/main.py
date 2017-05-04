@@ -304,8 +304,8 @@ def copy_inputs(*tensors, **kwargs):
 def average_batch_norm_stats(model):
     for m in model.modules():
         if isinstance(m, nn.BatchNorm2d):
-            nccl2.all_reduce(m.running_mean, output=m.running_mean)
-            nccl2.all_reduce(m.running_var, output=m.running_var)
+            nccl2.all_reduce(m.running_mean)
+            nccl2.all_reduce(m.running_var)
             m.running_mean /= args.num_replicas
             m.running_var /= args.num_replicas
 
@@ -330,8 +330,8 @@ def all_reduce_grads():
     scale_factor = 1.0 / args.num_replicas
     tensors = [p.grad.data for p in vars_to_reduce]
     if len(tensors) == 1:
-        reduce_stream.wait_stream(default_stream)
         tensors[0] *= scale_factor
+        reduce_stream.wait_stream(default_stream)
         nccl2.all_reduce(tensors[0], stream=reduce_stream)
     else:
         buf = torch.cat([t.contiguous().view(-1) for t in tensors], 0)
