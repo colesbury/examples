@@ -326,16 +326,17 @@ def all_reduce_grads():
         reduce_stream = torch.cuda.Stream()
 
     default_stream = torch.cuda.current_stream()
-    reduce_stream.wait_stream(default_stream)
 
     scale_factor = 1.0 / args.num_replicas
     tensors = [p.grad.data for p in vars_to_reduce]
     if len(tensors) == 1:
-        nccl2.all_reduce(tensors[0], stream=reduce_stream)
+        reduce_stream.wait_stream(default_stream)
         tensors[0] *= scale_factor
+        nccl2.all_reduce(tensors[0], stream=reduce_stream)
     else:
         buf = torch.cat([t.contiguous().view(-1) for t in tensors], 0)
         buf *= scale_factor
+        reduce_stream.wait_stream(default_stream)
         nccl2.all_reduce(buf, stream=reduce_stream)
         offset = 0
         for t in tensors:
