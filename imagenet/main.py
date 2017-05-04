@@ -206,6 +206,10 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
+        if i == 10:
+            batch_time.reset()
+            data_time.reset()
+            all_reduce_time.reset()
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -286,7 +290,7 @@ def copy_inputs(*tensors, **kwargs):
     """Copies tensors on a background stream to the GPU"""
     global copy_stream
     if copy_stream is None:
-        copy_stream = torch.cuda.Stream()
+        copy_stream = torch.cuda.Stream(priority=-1)
     default_stream = torch.cuda.current_stream()
 
     outputs = []
@@ -311,7 +315,7 @@ def average_batch_norm_stats(model):
 
 
 reduce_stream = None
-buffer_size = 10485760
+buffer_size = 2*10485760
 vars_to_reduce = []
 vars_seen = set()
 size_bytes = [0]
