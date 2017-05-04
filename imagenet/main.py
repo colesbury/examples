@@ -73,11 +73,12 @@ parser.add_argument('--checkpoint-dir', metavar='DIR', default='.',
 
 best_prec1 = 0
 rank = None
+device = None
 copy_stream = None
 
 
 def main():
-    global args, rank
+    global args, rank, device
     args = parser.parse_args()
     print(args)
 
@@ -119,7 +120,8 @@ def main2():
     if args.resume:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
-            checkpoint = torch.load(args.resume)
+            device_map = {'cuda:0':'cuda:' + str(device)}
+            checkpoint = torch.load(args.resume, map_location=device_map)
             args.start_epoch = checkpoint['epoch']
             best_prec1 = checkpoint['best_prec1']
             model.load_state_dict(checkpoint['state_dict'])
