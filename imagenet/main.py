@@ -114,7 +114,7 @@ def main2():
         nccl2.broadcast(param.data, root=0)
 
     # call all_reduce using backward hooks
-    register_all_reduce_hooks(model)
+    # register_all_reduce_hooks(model)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -223,7 +223,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
-        finish_all_reduce(all_reduce_time)
+        all_reduce_model(model, all_reduce_time)
         optimizer.step()
 
         # measure elapsed time
@@ -389,6 +389,20 @@ def finish_all_reduce(all_reduce_time):
     events[0].record()
     default_stream.wait_stream(reduce_stream)
     events[1].record()
+
+
+def all_reduce_model(model, all_reduce_time):
+    scale_factor = 1.0 / args.num_replicas
+    grads = [p.grad.data for p in model.parameters()]
+    for tensors in torch.cuda.comm._take_tensors(grads, buffer_size):
+        buf = torch.cat([t.contiguous().view(-1) for t in tensors])
+        buf *= scale_factor
+        nccl2.all_reduce(buf)
+        offset = 0
+        for t in tensors:
+            numel = t.numel()
+            t.set_(buf[offset:offset+numel].view_as(t))
+            offset += numel
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
