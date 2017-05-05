@@ -204,6 +204,11 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
+        if i == 10:
+            batch_time.reset()
+            data_time.reset()
+            all_reduce_time.reset()
+
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -323,7 +328,7 @@ def all_reduce_grads(model, all_reduce_time):
 
     events[0].record()
     buffer_size = 10485760
-    scale_factor = args.batch_size / 256.0
+    scale_factor = 1.0 / args.num_replicas
     params = list(model.parameters())
     for chunk in torch.cuda.comm._take_tensors(params, buffer_size):
         tensors = [p.grad.data for p in chunk]
