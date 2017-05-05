@@ -70,22 +70,29 @@ parser.add_argument('--ttl', metavar='TTL', type=int, default=1,
                     help='TTL for multicast discovery')
 parser.add_argument('--checkpoint-dir', metavar='DIR', default='.',
                     help='checkpoint directory')
+parser.add_argument('--rank', metavar='RANK', type=int,
+                    help='rank')
+parser.add_argument('--device', metavar='DEV', type=int,
+                    help='device')
 
 best_prec1 = 0
 rank = None
 copy_stream = None
+device = None
 
 
 def main():
-    global args, rank
+    global args, rank, device
     args = parser.parse_args()
     print(args)
+    rank, device = args.rank, args.device
 
     if not os.path.exists(args.checkpoint_dir):
         os.makedirs(args.checkpoint_dir)
 
-    rank, device = rendezvous.rendezvous(args.num_replicas, args.ttl)
+    print('rank', rank, 'device', device)
     with torch.cuda.device(device):
+        rendezvous.rendezvous(args.num_replicas, rank, args.ttl)
         main2()
 
 

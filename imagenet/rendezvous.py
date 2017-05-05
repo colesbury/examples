@@ -1,5 +1,3 @@
-import bisect
-import random
 import socket
 import struct
 import time
@@ -10,14 +8,14 @@ MULTICAST_GROUP4 = ('224.66.41.62', 35552)
 MULTICAST_GROUP6 = ('ff15:1e18:5d4c:4cf0:d02d:b659:53ba:b0a7', 35552)
 
 
-def rendezvous(num_replicas, ttl=1):
+def rendezvous(num_replicas, rank, device, ttl=1):
     """Uses IP multicast to detect other replicas and exchange NCCL unique id
-
-    Return: rank, device
     """
 
-    uid = nccl2.get_unique_id()
-    token = random.randint(0, 2**63 - 1)
+    if rank == 0:
+        uid = nccl2.get_unique_id()
+    else:
+        uid = b''
 
     group = MULTICAST_GROUP6  # switch to MULTICAST_GROUP4 for IPv4
     addrinfo = socket.getaddrinfo(group[0], None)[0]
@@ -26,7 +24,7 @@ def rendezvous(num_replicas, ttl=1):
     uids = {}
     addresses = {}
 
-    sendmsg = struct.pack('!q', token) + bytes(uid)
+    sendmsg = struct.pack('!q', rank) + bytes(uid)
 
     with socket.socket(addrinfo[0], socket.SOCK_DGRAM) as sock:
         group_bin = socket.inet_pton(addrinfo[0], addrinfo[4][0])
@@ -61,25 +59,10 @@ def rendezvous(num_replicas, ttl=1):
                 sock.sendto(sendmsg, group)
                 continue
 
-    tokens = sorted(tokens)
-    rank = bisect.bisect_left(tokens, token)
     if rank != 0:
-        uid = uids[tokens[0]]
+        uid = uids[0]
 
-    def get_device():
-        if torch.cuda.device_count() == 1:
-            # If there is only one visible device, use it
-            return 0
-        dev = 0
-        for t in tokens:
-            if t == token:
-                break
-            if addresses[t][0] == addresses[token][0]:
-                dev += 1
-        return dev
-
-    device = get_device()
-    print('rank', rank, 'device', device)
+    print('uid', bytes(uid))
     with torch.cuda.device(device):
         nccl2.initialize(num_replicas, uid, rank)
     return rank, device
