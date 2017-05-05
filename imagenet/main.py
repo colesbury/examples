@@ -206,6 +206,10 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
+        if i == 10:
+            batch_time.reset()
+            data_time.reset()
+            all_reduce_time.reset()
         # measure data loading time
         data_time.update(time.time() - end)
 
