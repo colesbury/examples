@@ -3,7 +3,6 @@ import os
 import shutil
 import time
 import math
-import random
 import multiprocessing
 
 import torch
@@ -36,7 +35,7 @@ parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet18',
                          ' (default: resnet18)')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=90, type=int, metavar='N',
+parser.add_argument('--epochs', default=120, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -141,14 +140,17 @@ def main2():
                                      std=[0.229, 0.224, 0.225])
 
     print("=> creating data loaders")
+    train_dataset = datasets.ImageFolder(traindir, transforms.Compose([
+        transforms.RandomSizedCrop(args.image_size),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        normalize,
+    ]))
+    sampler = DistributedSampler(train_dataset, args.num_replicas, rank)
+
     train_loader = torch.utils.data.DataLoader(
-        SubsampleDataset(datasets.ImageFolder(traindir, transforms.Compose([
-            transforms.RandomSizedCrop(args.image_size),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ])), rank, args.num_replicas),
-        batch_size=args.batch_size, shuffle=True,
+        train_dataset,
+        batch_size=args.batch_size, sampler=sampler,
         num_workers=args.workers, pin_memory=True)
 
     val_loader = torch.utils.data.DataLoader(
@@ -174,6 +176,7 @@ def main2():
 
     print("=> starting training")
     for epoch in range(args.start_epoch, args.epochs):
+        sampler.epoch = epoch
         adjust_learning_rate(optimizer, epoch)
 
         # train for one epoch
@@ -446,17 +449,36 @@ def accuracy(output, target, topk=(1,)):
     return res
 
 
-class SubsampleDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset, rank, n):
+class DistributedSampler(torch.utils.data.sampler.Sampler):
+    def __init__(self, dataset, num_replicas, rank):
         self.dataset = dataset
-        self.size = math.ceil(len(dataset) / n)
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+        self.num_samples = math.ceil(len(self.dataset) / self.num_replicas)
+        self.total_size = self.num_samples * self.num_replicas
 
-    def __getitem__(self, i):
-        i = random.randint(0, len(self.dataset) - 1)
-        return self.dataset[i]
+    def __iter__(self):
+        # deterministically shuffle based on epoch
+        g = torch.Generator()
+        g.manual_seed(self.epoch)
+        indices = list(torch.randperm(len(self.dataset), generator=g))
+
+        # add extra samples to make it evenly divisible
+        indices += indices[:(self.total_size - len(indices))]
+        assert len(indices) == self.total_size
+
+        print('new sampling epoch {} first item {}'.format(self.epoch, indices[0]))
+
+        # subsample
+        offset = self.num_samples * self.rank
+        indices = indices[offset:offset+self.num_samples]
+        assert len(indices) == self.num_samples
+
+        return iter(indices)
 
     def __len__(self):
-        return self.size
+        return self.num_samples
 
 
 if __name__ == '__main__':
