@@ -120,7 +120,9 @@ def main2():
     if args.resume:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
-            device_map = {'cuda:0':'cuda:' + str(device)}
+            device_map  ={}
+            for d in range(8):
+                device_map['cuda:' + str(d)] = 'cuda:' + str(device)
             checkpoint = torch.load(args.resume, map_location=device_map)
             args.start_epoch = checkpoint['epoch']
             best_prec1 = checkpoint['best_prec1']
