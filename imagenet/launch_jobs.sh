@@ -3,7 +3,7 @@ IMAGENET_DIR=${IMAGENET_DIR:-/data/local/packages/ai-group.imagenet-full-size/pr
 NUM_LOCAL=$1
 NUM_REPLICAS=${2:-$1}
 LR=${3:-0.1}
-RESUME=/mnt/vol/gfsai-east/ai-group/users/sgross/resnet-nccl2/resnet50-epoch5.pt
+RESUME=/data/users/sgross/resnet50-epoch5.pt
 if [ -z $NUM_LOCAL ]; then
   echo "usage: ./launch_jobs.sh NUM_LOCAL [NUM_REPLICAS] [LR]"
   exit 1
