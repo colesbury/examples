@@ -12,6 +12,6 @@ for i in $(seq 0 $((NUM_LOCAL-1)))
 do
   echo $i
   CHECKPOINT_DIR=replica$i
-  python3 -u main.py -a resnet50 --num-replicas $NUM_REPLICAS --epochs 20 -b 32 --lr $LR --checkpoint-dir $CHECKPOINT_DIR $IMAGENET_DIR &>replica$i.log &
+  python3 -u main.py -a resnet50 --num-replicas $NUM_REPLICAS --epochs 40 -b 64 --lr $LR --checkpoint-dir $CHECKPOINT_DIR $IMAGENET_DIR &>replica$i.log &
 done
 wait
