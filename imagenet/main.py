@@ -1,18 +1,19 @@
 import argparse
 import os
-import shutil
+import queue
 import time
+import threading
 
 import torch
 import torch.nn as nn
+from torch.nn.parallel.scatter_gather import scatter
+import torch.nn.functional as F
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
 import torchvision.models as models
 
 model_names = sorted(name for name in models.__dict__
@@ -59,6 +60,31 @@ parser.add_argument('--dist-backend', default='gloo', type=str,
 best_prec1 = 0
 
 
+class CombinedModel(nn.Module):
+    def __init__(self, base):
+        super(CombinedModel, self).__init__()
+        self.base = base
+
+    def forward(self, x, target):
+        x = self.base(x)
+        return F.cross_entropy(x, target)
+
+
+def _thread_main(model, optimizer, in_queue, out_queue):
+    def step(input, target):
+        loss = model(input, target)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    while True:
+        obj = in_queue.get()
+        if obj is None:
+            return
+        step(obj[0], obj[1])
+        out_queue.put(True)
+
+
 def main():
     global args, best_prec1
     args = parser.parse_args()
@@ -70,29 +96,34 @@ def main():
                                 world_size=args.world_size)
 
     # create model
-    if args.pretrained:
-        print("=> using pre-trained model '{}'".format(args.arch))
-        model = models.__dict__[args.arch](pretrained=True)
-    else:
-        print("=> creating model '{}'".format(args.arch))
-        model = models.__dict__[args.arch]()
+    networks = []
+    in_queues = []
+    out_queues = []
+    optimizers = []
+    threads = []
+    for i in range(torch.cuda.device_count()):
+        with torch.cuda.device(i):
+            # combine network with loss function
+            model = CombinedModel(models.__dict__[args.arch]()).cuda()
+            networks.append(model)
 
-    if not args.distributed:
-        if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
-            model.features = torch.nn.DataParallel(model.features)
-            model.cuda()
-        else:
-            model = torch.nn.DataParallel(model).cuda()
-    else:
-        model.cuda()
-        model = torch.nn.parallel.DistributedDataParallel(model)
+            # optimizer per GPU
+            optimizer = torch.optim.SGD(model.parameters(), args.lr,
+                                        momentum=args.momentum,
+                                        weight_decay=args.weight_decay)
+            optimizers.append(optimizer)
 
-    # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
+            # queue for input, target pairs
+            in_queue = queue.Queue()
+            in_queues.append(in_queue)
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+            # output queue
+            out_queue = queue.Queue()
+            out_queues.append(out_queue)
+
+            thread = threading.Thread(target=_thread_main, args=(model, optimizer, in_queue, out_queue))
+            thread.start()
+            threads.append(thread)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -110,68 +141,13 @@ def main():
 
     cudnn.benchmark = True
 
-    # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    valdir = os.path.join(args.data, 'val')
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose([
-            transforms.RandomSizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]))
-
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-    else:
-        train_sampler = None
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Scale(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
-
-    if args.evaluate:
-        validate(val_loader, model, criterion)
-        return
 
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
-        adjust_learning_rate(optimizer, epoch)
-
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch)
-
-        # evaluate on validation set
-        prec1 = validate(val_loader, model, criterion)
-
-        # remember best prec@1 and save checkpoint
-        is_best = prec1 > best_prec1
-        best_prec1 = max(prec1, best_prec1)
-        save_checkpoint({
-            'epoch': epoch + 1,
-            'arch': args.arch,
-            'state_dict': model.state_dict(),
-            'best_prec1': best_prec1,
-            'optimizer' : optimizer.state_dict(),
-        }, is_best)
+        train(networks, in_queues, out_queues)
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(networks, in_queues, out_queues):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -179,31 +155,32 @@ def train(train_loader, model, criterion, optimizer, epoch):
     top5 = AverageMeter()
 
     # switch to train mode
-    model.train()
+    for model in networks:
+        model.train()
 
-    end = time.time()
-    for i, (input, target) in enumerate(train_loader):
-        # measure data loading time
-        data_time.update(time.time() - end)
+    # create
+    input = torch.randn(args.batch_size, 3, 224, 224).pin_memory()
+    target = torch.LongTensor(args.batch_size).fill_(1).pin_memory()
+    device_ids = list(range(torch.cuda.device_count()))
 
-        target = target.cuda(async=True)
+    def step_all_gpus():
         input_var = torch.autograd.Variable(input)
         target_var = torch.autograd.Variable(target)
 
-        # compute output
-        output = model(input_var)
-        loss = criterion(output, target_var)
+        scattered_inputs = scatter((input_var, target_var), device_ids)
+        for in_queue, input_target in zip(in_queues, scattered_inputs):
+            in_queue.put(input_target)
 
-        # measure accuracy and record loss
-        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
-        losses.update(loss.data[0], input.size(0))
-        top1.update(prec1[0], input.size(0))
-        top5.update(prec5[0], input.size(0))
+        # Wait until all the kernels are enqueued
+        for out_queue in out_queues:
+            out_queue.get()
 
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    end = time.time()
+    for i in range(5005):
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        step_all_gpus()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -216,58 +193,8 @@ def train(train_loader, model, criterion, optimizer, epoch):
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
                   'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                   epoch, i, len(train_loader), batch_time=batch_time,
+                   1, i, 5005, batch_time=batch_time,
                    data_time=data_time, loss=losses, top1=top1, top5=top5))
-
-
-def validate(val_loader, model, criterion):
-    batch_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
-    top5 = AverageMeter()
-
-    # switch to evaluate mode
-    model.eval()
-
-    end = time.time()
-    for i, (input, target) in enumerate(val_loader):
-        target = target.cuda(async=True)
-        input_var = torch.autograd.Variable(input, volatile=True)
-        target_var = torch.autograd.Variable(target, volatile=True)
-
-        # compute output
-        output = model(input_var)
-        loss = criterion(output, target_var)
-
-        # measure accuracy and record loss
-        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
-        losses.update(loss.data[0], input.size(0))
-        top1.update(prec1[0], input.size(0))
-        top5.update(prec5[0], input.size(0))
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        if i % args.print_freq == 0:
-            print('Test: [{0}/{1}]\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                   i, len(val_loader), batch_time=batch_time, loss=losses,
-                   top1=top1, top5=top5))
-
-    print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
-          .format(top1=top1, top5=top5))
-
-    return top1.avg
-
-
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    torch.save(state, filename)
-    if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
 
 
 class AverageMeter(object):
